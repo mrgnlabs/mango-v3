@@ -1253,7 +1253,7 @@ impl MangoInstruction {
                 }
             }
             27 => {
-                let data = array_ref![data, 0, 34];
+                let data = array_ref![data, 0, 1 + USIZE_BYTES + 1 + USIZE_BYTES + 16];
                 let (asset_type, asset_index, liab_type, liab_index, max_liab_transfer) =
                     array_refs![data, 1, USIZE_BYTES, 1, USIZE_BYTES, 16];
 
