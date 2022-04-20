@@ -17,5 +17,5 @@ devnet = []
 default = []
 
 [dependencies]
-anchor-lang = "0.22.1"
+anchor-lang = { rev = "v0.22.1", git = "https://github.com/project-serum/anchor.git" }
 base64 = "0.13.0"
