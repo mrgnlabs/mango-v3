@@ -1,4 +1,4 @@
-use crate::matching::{OrderType, Side};
+use crate::matching::{ExpiryType, OrderType, Side};
 use crate::state::{AssetType, INFO_LEN};
 use crate::state::{TriggerCondition, MAX_PAIRS};
 use arrayref::{array_ref, array_refs};
@@ -55,9 +55,9 @@ pub enum MangoInstruction {
     /// 0. `[]` mango_group_ai - MangoGroup that this mango account is for
     /// 1. `[writable]` mango_account_ai - the mango account for this user
     /// 2. `[signer]` owner_ai - Solana account of owner of the mango account
-    /// 3. `[]` mango_cache_ai - MangoCache
-    /// 4. `[]` root_bank_ai - RootBank owned by MangoGroup
-    /// 5. `[writable]` node_bank_ai - NodeBank owned by RootBank
+    /// 3. `[writable]` mango_cache_ai - MangoCache
+    /// 4. `[writable]` root_bank_ai - RootBank of token being deposited
+    /// 5. `[writable]` node_bank_ai - NodeBank
     /// 6. `[writable]` vault_ai - TokenAccount owned by MangoGroup
     /// 7. `[]` token_prog_ai - acc pointed to by SPL token program id
     /// 8. `[writable]` owner_token_account_ai - TokenAccount owned by user which will be sending the funds
@@ -1012,9 +1012,15 @@ pub enum MangoInstruction {
 
         /// Timestamp of when order expires
         ///
-        /// Send 0 if you want the order to never expire.
-        /// Timestamps in the past mean the instruction is skipped.
-        /// Timestamps in the future are reduced to now + 255s.
+        /// If expiry_type is Absolute:
+        /// - Send 0 if you want the order to never expire.
+        /// - Timestamps in the past mean the instruction is skipped.
+        /// - Timestamps in the future are reduced to now + 255s.
+        ///
+        /// If expiry_type is Relative:
+        /// - Must be between 1 and 255.
+        /// - The order will expire when the block timestamp has reached or exceeded
+        ///   the current block timestamp plus that number of seconds.
         expiry_timestamp: u64,
 
         side: Side,
@@ -1029,6 +1035,9 @@ pub enum MangoInstruction {
         /// Use this to limit compute used during order matching.
         /// When the limit is reached, processing stops and the instruction succeeds.
         limit: u8,
+
+        /// Can be 0 -> Absolute or 1 -> Relative; see expiry_timestamp
+        expiry_type: ExpiryType,
     },
 
     /// Cancels all the spot orders pending for a mango account
@@ -1531,6 +1540,7 @@ impl MangoInstruction {
                     reduce_only,
                     limit,
                 ) = array_refs![data_arr, 8, 8, 8, 8, 8, 1, 1, 1, 1];
+                let expiry_type_byte = if data.len() > 44 { data[44] } else { 0 };
                 MangoInstruction::PlacePerpOrder2 {
                     price: i64::from_le_bytes(*price),
                     max_base_quantity: i64::from_le_bytes(*max_base_quantity),
@@ -1541,6 +1551,7 @@ impl MangoInstruction {
                     order_type: OrderType::try_from_primitive(order_type[0]).ok()?,
                     reduce_only: reduce_only[0] != 0,
                     limit: u8::from_le_bytes(*limit),
+                    expiry_type: ExpiryType::try_from_primitive(expiry_type_byte).ok()?,
                 }
             }
             65 => {
@@ -1770,6 +1781,7 @@ pub fn upgrade_mango_account_v0_v1(
     Ok(Instruction { program_id: *program_id, accounts, data })
 }
 
+/// Note: this instruction will not work if/when a new node bank is added
 pub fn deposit(
     program_id: &Pubkey,
     mango_group_pk: &Pubkey,
@@ -1787,8 +1799,8 @@ pub fn deposit(
         AccountMeta::new_readonly(*mango_group_pk, false),
         AccountMeta::new(*mango_account_pk, false),
         AccountMeta::new_readonly(*owner_pk, true),
-        AccountMeta::new_readonly(*mango_cache_pk, false),
-        AccountMeta::new_readonly(*root_bank_pk, false),
+        AccountMeta::new(*mango_cache_pk, false),
+        AccountMeta::new(*root_bank_pk, false),
         AccountMeta::new(*node_bank_pk, false),
         AccountMeta::new(*vault_pk, false),
         AccountMeta::new_readonly(spl_token::ID, false),
@@ -1963,6 +1975,7 @@ pub fn place_perp_order2(
     reduce_only: bool,
     expiry_timestamp: Option<u64>, // Send 0 if you want to ignore time in force
     limit: u8,                     // maximum number of FillEvents before terminating
+    expiry_type: ExpiryType,
 ) -> Result<Instruction, ProgramError> {
     let mut accounts = vec![
         AccountMeta::new_readonly(*mango_group_pk, false),
@@ -1988,6 +2001,7 @@ pub fn place_perp_order2(
         reduce_only,
         expiry_timestamp: expiry_timestamp.unwrap_or(0),
         limit,
+        expiry_type,
     };
     let data = instr.pack();
 

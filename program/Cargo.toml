@@ -1,6 +1,6 @@
 [package]
 name = "mango"
-version = "3.4.3"
+version = "3.4.7"
 authors = ["blockworks"]
 edition = "2018"
 
@@ -35,7 +35,7 @@ pyth-client = {version = ">=0.5.0", features = ["no-entrypoint"]}
 switchboard-program = ">=0.2.0"
 switchboard-utils = ">=0.1.36"
 
-anchor-lang = "0.22.1"
+anchor-lang = ">=0.24.2"
 
 [dev-dependencies]
 solana-sdk = ">=1.9.0"

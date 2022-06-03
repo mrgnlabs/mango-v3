@@ -26,16 +26,19 @@ use switchboard_program::FastRoundResultAccountData;
 use mango_common::Loadable;
 use mango_logs::{
     mango_emit_heap, mango_emit_stack, CachePerpMarketsLog, CachePricesLog, CacheRootBanksLog,
-    CancelAllPerpOrdersLog, DepositLog, LiquidatePerpMarketLog, LiquidateTokenAndPerpLog,
+    CancelAllPerpOrdersLog, CloseMangoAccountLog, CloseSpotOpenOrdersLog, CreateMangoAccountLog,
+    CreateSpotOpenOrdersLog, DepositLog, LiquidatePerpMarketLog, LiquidateTokenAndPerpLog,
     LiquidateTokenAndTokenLog, MngoAccrualLog, OpenOrdersBalanceLog, PerpBankruptcyLog,
     RedeemMngoLog, SettleFeesLog, SettlePnlLog, TokenBalanceLog, TokenBankruptcyLog,
     UpdateFundingLog, UpdateRootBankLog, WithdrawLog,
 };
 
 use crate::error::{check_assert, MangoError, MangoErrorCode, MangoResult, SourceFileId};
-use crate::ids::{msrm_token, srm_token};
+use crate::ids::{
+    luna_perp_market, luna_pyth_oracle, luna_root_bank, luna_spot_market, msrm_token, srm_token,
+};
 use crate::instruction::MangoInstruction;
-use crate::matching::{Book, BookSide, OrderType, Side};
+use crate::matching::{Book, BookSide, ExpiryType, OrderType, Side};
 use crate::oracle::{determine_oracle_type, OracleType, StubOracle, STUB_MAGIC};
 use crate::queue::{EventQueue, EventType, FillEvent, LiquidateEvent, OutEvent};
 #[cfg(not(feature = "devnet"))]
@@ -206,6 +209,13 @@ impl Processor {
         mango_account.order_market = [FREE_ORDER_SLOT; MAX_PERP_OPEN_ORDERS];
         mango_account.meta_data = MetaData::new(DataType::MangoAccount, 0, true);
         mango_account.not_upgradable = true;
+
+        mango_emit_heap!(CreateMangoAccountLog {
+            mango_group: *mango_group_ai.key,
+            mango_account: *mango_account_ai.key,
+            owner: *owner_ai.key,
+        });
+
         Ok(())
     }
 
@@ -272,6 +282,12 @@ impl Processor {
         mango_account.delegate = Pubkey::default();
         mango_account.in_margin_basket = [false; MAX_PAIRS];
         mango_account.info = [0; INFO_LEN];
+
+        mango_emit_heap!(CloseMangoAccountLog {
+            mango_group: *mango_group_ai.key,
+            mango_account: *mango_account_ai.key,
+            owner: *owner_ai.key
+        });
 
         Ok(())
     }
@@ -870,16 +886,16 @@ impl Processor {
 
     #[inline(never)]
     /// Deposit instruction
+    /// Note: this won't work if there are more than 1 NodeBanks
     fn deposit(program_id: &Pubkey, accounts: &[AccountInfo], quantity: u64) -> MangoResult<()> {
-        // TODO - consider putting update crank here
         const NUM_FIXED: usize = 9;
         let accounts = array_ref![accounts, 0, NUM_FIXED];
         let [
             mango_group_ai,         // read
             mango_account_ai,       // write
             owner_ai,               // read
-            mango_cache_ai,         // read
-            root_bank_ai,           // read
+            mango_cache_ai,         // write
+            root_bank_ai,           // write
             node_bank_ai,           // write
             vault_ai,               // write
             token_prog_ai,          // read
@@ -908,14 +924,30 @@ impl Processor {
         let mut node_bank = NodeBank::load_mut_checked(node_bank_ai, program_id)?;
         check_eq!(&node_bank.vault, vault_ai.key, MangoErrorCode::InvalidVault)?;
 
-        // deposit into node bank token vault using invoke_transfer
-        invoke_transfer(token_prog_ai, owner_token_account_ai, vault_ai, owner_ai, &[], quantity)?;
-
         // Check validity of root bank cache
         let now_ts = Clock::get()?.unix_timestamp as u64;
         let root_bank_cache = &mango_cache.root_bank_cache[token_index];
-        let deposit = I80F48::from_num(quantity);
         root_bank_cache.check_valid(&mango_group, now_ts)?;
+
+        let is_luna_token = root_bank_ai.key == &luna_root_bank::ID;
+        let reduce_only = is_luna_token;
+
+        let quantity = if reduce_only {
+            let max_deposit = mango_account
+                .get_native_borrow(root_bank_cache, token_index)?
+                .checked_floor()
+                .unwrap()
+                .checked_to_num()
+                .unwrap();
+            quantity.min(max_deposit)
+        } else {
+            quantity
+        };
+
+        // deposit into node bank token vault using invoke_transfer
+        invoke_transfer(token_prog_ai, owner_token_account_ai, vault_ai, owner_ai, &[], quantity)?;
+
+        let deposit = I80F48::from(quantity);
 
         checked_change_net(
             root_bank_cache,
@@ -1137,7 +1169,12 @@ impl Processor {
         for oracle_ai in oracle_ais.iter() {
             let oracle_index = mango_group.find_oracle_index(oracle_ai.key).ok_or(throw!())?;
 
-            if let Ok(price) = read_oracle(&mango_group, oracle_index, oracle_ai) {
+            if let Ok(price) = read_oracle(
+                &mango_group,
+                oracle_index,
+                oracle_ai,
+                mango_cache.price_cache[oracle_index].price,
+            ) {
                 mango_cache.price_cache[oracle_index] = PriceCache { price, last_update };
 
                 oracle_indexes.push(oracle_index as u64);
@@ -1265,6 +1302,9 @@ impl Processor {
             token_prog_ai,      // read
         ] = fixed_ais;
         check_eq!(&spl_token::ID, token_prog_ai.key, MangoErrorCode::InvalidProgramId)?;
+
+        let is_luna_token = root_bank_ai.key == &luna_root_bank::ID;
+        check!(!(is_luna_token && allow_borrow), MangoErrorCode::InvalidAllowBorrow)?;
 
         let mango_group = MangoGroup::load_checked(mango_group_ai, program_id)?;
         check!(signer_ai.key == &mango_group.signer_key, MangoErrorCode::InvalidSignerKey)?;
@@ -1407,6 +1447,13 @@ impl Processor {
 
         mango_account.spot_open_orders[market_index] = *open_orders_ai.key;
 
+        mango_emit_heap!(CreateSpotOpenOrdersLog {
+            mango_group: *mango_group_ai.key,
+            mango_account: *mango_account_ai.key,
+            open_orders: *open_orders_ai.key,
+            spot_market: *spot_market_ai.key,
+        });
+
         Ok(())
     }
 
@@ -1493,6 +1540,13 @@ impl Processor {
 
         mango_account.spot_open_orders[market_index] = *open_orders_ai.key;
 
+        mango_emit_heap!(CreateSpotOpenOrdersLog {
+            mango_group: *mango_group_ai.key,
+            mango_account: *mango_account_ai.key,
+            open_orders: *open_orders_ai.key,
+            spot_market: *spot_market_ai.key,
+        });
+
         Ok(())
     }
 
@@ -1552,6 +1606,13 @@ impl Processor {
         )?;
 
         mango_account.spot_open_orders[market_index] = Pubkey::default();
+
+        mango_emit_heap!(CloseSpotOpenOrdersLog {
+            mango_group: *mango_group_ai.key,
+            mango_account: *mango_account_ai.key,
+            open_orders: *open_orders_ai.key,
+            spot_market: *spot_market_ai.key,
+        });
 
         Ok(())
     }
@@ -1700,20 +1761,63 @@ impl Processor {
         };
 
         // Enforce order price limits if the order is a limit order that goes on the book
-        let native_price = {
+        let (coin_lot_size, pc_lot_size) = {
             let market = load_market_state(spot_market_ai, dex_prog_ai.key)?;
-
-            I80F48::from_num(order.limit_price.get())
-                .checked_mul(I80F48::from_num(market.pc_lot_size))
-                .unwrap()
-                .checked_div(I80F48::from_num(market.coin_lot_size))
-                .unwrap()
+            (market.coin_lot_size, market.pc_lot_size)
         };
+        let native_price = I80F48::from_num(order.limit_price.get())
+            .checked_mul(I80F48::from_num(pc_lot_size))
+            .unwrap()
+            .checked_div(I80F48::from_num(coin_lot_size))
+            .unwrap();
+
         let oracle_price = mango_cache.get_price(market_index);
         let info = &mango_group.spot_markets[market_index];
 
         // If not post_allowed, then pre_locked may not increase
-        let (post_allowed, pre_locked) = {
+        let is_luna_market = spot_market_ai.key == &luna_spot_market::ID;
+        let (post_allowed, pre_locked) = if is_luna_market {
+            let open_orders = load_open_orders(&open_orders_ais[market_index])?;
+            // only one open order at a time
+            check!(
+                open_orders.free_slot_bits == u128::MAX,
+                MangoErrorCode::InvalidOrderInClosingMarket
+            )?;
+
+            // For markets in close only mode:
+            // if long, sell quantity may only be as large as position
+            // if short, buy quantity may only be as large as position
+            let net_pos = mango_account
+                .get_net(&mango_cache.root_bank_cache[market_index], market_index)
+                .checked_add(I80F48::from_num(open_orders.native_coin_total))
+                .unwrap();
+
+            let order_quantity = order.max_coin_qty.get().checked_mul(coin_lot_size).unwrap();
+            match order_side {
+                serum_dex::matching::Side::Bid => {
+                    check!(
+                        net_pos.is_negative() && order_quantity <= net_pos.abs().to_num::<u64>(),
+                        MangoErrorCode::InvalidOrderInClosingMarket
+                    )?;
+
+                    (
+                        order.limit_price.get() < 10,
+                        open_orders.native_pc_total - open_orders.native_pc_free,
+                    )
+                }
+                serum_dex::matching::Side::Ask => {
+                    check!(
+                        net_pos.is_positive() && order_quantity <= net_pos.to_num::<u64>(),
+                        MangoErrorCode::InvalidOrderInClosingMarket
+                    )?;
+
+                    (
+                        native_price.checked_div(oracle_price).unwrap() >= info.maint_asset_weight,
+                        open_orders.native_coin_total - open_orders.native_coin_free,
+                    )
+                }
+            }
+        } else {
             let open_orders = load_open_orders(&open_orders_ais[market_index])?;
             match order_side {
                 serum_dex::matching::Side::Bid => (
@@ -1814,11 +1918,12 @@ impl Processor {
         )?;
         let post_health = health_cache.get_health(&mango_group, HealthType::Init);
 
-        // If an account is in reduce_only mode, health must only go up
-        check!(
-            post_health >= ZERO_I80F48 || (reduce_only && post_health >= pre_health),
-            MangoErrorCode::InsufficientFunds
-        )?;
+        if reduce_only {
+            // If an account is in reduce_only mode, health must only go up
+            check!(post_health >= pre_health, MangoErrorCode::InsufficientFunds)?;
+        } else {
+            check!(post_health >= ZERO_I80F48, MangoErrorCode::InsufficientFunds)?;
+        }
 
         mango_emit_heap!(OpenOrdersBalanceLog {
             mango_group: *mango_group_ai.key,
@@ -1987,21 +2092,64 @@ impl Processor {
         };
 
         // Enforce order price limits if the order is a limit order that goes on the book
-        let native_price = {
-            // Conver the price in
+        let (coin_lot_size, pc_lot_size) = {
             let market = load_market_state(spot_market_ai, dex_prog_ai.key)?;
-            I80F48::from_num(order.limit_price.get())
-                .checked_mul(I80F48::from_num(market.pc_lot_size))
-                .unwrap()
-                .checked_div(I80F48::from_num(market.coin_lot_size))
-                .unwrap()
+            (market.coin_lot_size, market.pc_lot_size)
         };
+        let native_price = I80F48::from_num(order.limit_price.get())
+            .checked_mul(I80F48::from_num(pc_lot_size))
+            .unwrap()
+            .checked_div(I80F48::from_num(coin_lot_size))
+            .unwrap();
+
         let oracle_price = mango_cache.get_price(market_index);
         let info = &mango_group.spot_markets[market_index];
         let market_open_orders_ai = open_orders_ais[market_index].unwrap();
 
         // If not post_allowed, then pre_locked may not increase
-        let (post_allowed, pre_locked) = {
+        let is_luna_market = spot_market_ai.key == &luna_spot_market::ID;
+        let (post_allowed, pre_locked) = if is_luna_market {
+            let open_orders = load_open_orders(market_open_orders_ai)?;
+            // only one open order at a time
+            check!(
+                open_orders.free_slot_bits == u128::MAX,
+                MangoErrorCode::InvalidOrderInClosingMarket
+            )?;
+
+            // For markets in close only mode:
+            // if long, sell quantity may only be as large as position
+            // if short, buy quantity may only be as large as position
+            let net_pos = mango_account
+                .get_net(&mango_cache.root_bank_cache[market_index], market_index)
+                .checked_add(I80F48::from_num(open_orders.native_coin_total))
+                .unwrap();
+
+            let order_quantity = order.max_coin_qty.get().checked_mul(coin_lot_size).unwrap();
+            match order_side {
+                serum_dex::matching::Side::Bid => {
+                    check!(
+                        net_pos.is_negative() && order_quantity <= net_pos.abs().to_num::<u64>(),
+                        MangoErrorCode::InvalidOrderInClosingMarket
+                    )?;
+
+                    (
+                        order.limit_price.get() < 10,
+                        open_orders.native_pc_total - open_orders.native_pc_free,
+                    )
+                }
+                serum_dex::matching::Side::Ask => {
+                    check!(
+                        net_pos.is_positive() && order_quantity <= net_pos.to_num::<u64>(),
+                        MangoErrorCode::InvalidOrderInClosingMarket
+                    )?;
+
+                    (
+                        native_price.checked_div(oracle_price).unwrap() >= info.maint_asset_weight,
+                        open_orders.native_coin_total - open_orders.native_coin_free,
+                    )
+                }
+            }
+        } else {
             let open_orders = load_open_orders(market_open_orders_ai)?;
             match order_side {
                 serum_dex::matching::Side::Bid => (
@@ -2105,11 +2253,12 @@ impl Processor {
         )?;
         let post_health = health_cache.get_health(&mango_group, HealthType::Init);
 
-        // If an account is in reduce_only mode, health must only go up
-        check!(
-            post_health >= ZERO_I80F48 || (reduce_only && post_health >= pre_health),
-            MangoErrorCode::InsufficientFunds
-        )?;
+        if reduce_only {
+            // If an account is in reduce_only mode, health must only go up
+            check!(post_health >= pre_health, MangoErrorCode::InsufficientFunds)?;
+        } else {
+            check!(post_health >= ZERO_I80F48, MangoErrorCode::InsufficientFunds)?;
+        }
 
         mango_emit_heap!(OpenOrdersBalanceLog {
             mango_group: *mango_group_ai.key,
@@ -2381,6 +2530,9 @@ impl Processor {
             event_queue_ai,     // write
         ] = fixed_ais;
 
+        let is_luna_market = perp_market_ai.key == &luna_perp_market::ID;
+        check!(!is_luna_market || reduce_only, MangoErrorCode::ReduceOnlyRequired)?;
+
         let referrer_mango_account_ai = opt_ais.first();
 
         let mango_group = MangoGroup::load_checked(mango_group_ai, program_id)?;
@@ -2443,6 +2595,13 @@ impl Processor {
 
             if (side == Side::Bid && base_pos > 0) || (side == Side::Ask && base_pos < 0) {
                 0
+            } else if is_luna_market {
+                // Take into account outstanding open orders as well
+                let on_orders = match side {
+                    Side::Bid => mango_account.perp_accounts[market_index].bids_quantity,
+                    Side::Ask => mango_account.perp_accounts[market_index].asks_quantity,
+                };
+                base_pos.abs().checked_sub(on_orders).unwrap().min(quantity).max(0)
             } else {
                 base_pos.abs().min(quantity)
             }
@@ -2475,6 +2634,7 @@ impl Processor {
             now_ts,
             referrer_mango_account_ai,
             u8::MAX,
+            is_luna_market,
         )?;
 
         health_cache.update_perp_val(&mango_group, &mango_cache, &mango_account, market_index)?;
@@ -2498,6 +2658,7 @@ impl Processor {
         reduce_only: bool,
         expiry_timestamp: u64,
         limit: u8,
+        expiry_type: ExpiryType,
     ) -> MangoResult {
         check!(price > 0, MangoErrorCode::InvalidParam)?;
         check!(max_base_quantity > 0, MangoErrorCode::InvalidParam)?;
@@ -2517,6 +2678,9 @@ impl Processor {
             event_queue_ai,             // write
             referrer_mango_account_ai,  // write
         ] = fixed_ais;
+
+        let is_luna_market = perp_market_ai.key == &luna_perp_market::ID;
+        check!(!is_luna_market || reduce_only, MangoErrorCode::ReduceOnlyRequired)?;
 
         // If referrer same as user, assume no referrer
         let referrer_mango_account_ai = if referrer_mango_account_ai.key == mango_account_ai.key {
@@ -2541,17 +2705,28 @@ impl Processor {
         let open_orders_accounts = load_open_orders_accounts(&open_orders_ais)?;
 
         let now_ts = Clock::get()?.unix_timestamp as u64;
-        let time_in_force = if expiry_timestamp != 0 {
-            // If expiry is far in the future, clamp to 255 seconds
-            let tif = expiry_timestamp.saturating_sub(now_ts).min(255);
-            if tif == 0 {
-                // If expiry is in the past, ignore the order
-                msg!("Order is already expired");
-                return Ok(());
+        let time_in_force = match expiry_type {
+            ExpiryType::Absolute => {
+                if expiry_timestamp != 0 {
+                    // If expiry is far in the future, clamp to 255 seconds
+                    let tif = expiry_timestamp.saturating_sub(now_ts).min(255) as u8;
+                    if tif == 0 {
+                        // If expiry is in the past or now, ignore the order
+                        msg!("Order is already expired");
+                        return Ok(());
+                    }
+                    tif
+                } else {
+                    0 // never expire
+                }
             }
-            tif as u8
-        } else {
-            0 // never expire
+            ExpiryType::Relative => {
+                check!(
+                    expiry_timestamp > 0 && expiry_timestamp <= 255,
+                    MangoErrorCode::InvalidParam
+                )?;
+                expiry_timestamp as u8
+            }
         };
 
         let mut perp_market =
@@ -2604,6 +2779,13 @@ impl Processor {
 
             if (side == Side::Bid && base_pos > 0) || (side == Side::Ask && base_pos < 0) {
                 0
+            } else if is_luna_market {
+                // Take into account outstanding open orders as well
+                let on_orders = match side {
+                    Side::Bid => mango_account.perp_accounts[market_index].bids_quantity,
+                    Side::Ask => mango_account.perp_accounts[market_index].asks_quantity,
+                };
+                base_pos.abs().checked_sub(on_orders).unwrap().min(max_base_quantity).max(0)
             } else {
                 base_pos.abs().min(max_base_quantity)
             }
@@ -2635,6 +2817,7 @@ impl Processor {
             now_ts,
             referrer_mango_account_ai,
             limit,
+            is_luna_market,
         )?;
 
         health_cache.update_perp_val(&mango_group, &mango_cache, &mango_account, market_index)?;
@@ -2975,7 +3158,9 @@ impl Processor {
         let b_pnl: I80F48 = b.quote_position - new_quote_pos_b;
 
         // pnl must be opposite signs for there to be a settlement
-        if a_pnl * b_pnl > 0 {
+        if !((a_pnl.is_positive() && b_pnl.is_negative())
+            || (a_pnl.is_negative() && b_pnl.is_positive()))
+        {
             return Ok(());
         }
 
@@ -5342,6 +5527,11 @@ impl Processor {
         let mut perp_market =
             PerpMarket::load_mut_checked(perp_market_ai, program_id, mango_group_ai.key)?;
 
+        let is_luna_market = perp_market_ai.key == &luna_perp_market::ID;
+        if is_luna_market {
+            order.reduce_only = true;
+        }
+
         let mut health_cache = HealthCache::new(active_assets);
         health_cache.init_vals_with_orders_vec(
             &mango_group,
@@ -5402,6 +5592,7 @@ impl Processor {
                     i64::MAX,
                     order.order_type,
                     now_ts,
+                    is_luna_market,
                 )?,
                 Side::Ask => book.sim_new_ask(
                     &perp_market,
@@ -5460,6 +5651,7 @@ impl Processor {
                     now_ts,
                     None,
                     u8::MAX,
+                    is_luna_market,
                 )?;
 
                 // TODO OPT - unnecessary, remove after testing
@@ -5545,6 +5737,12 @@ impl Processor {
         mango_account.meta_data = MetaData::new(DataType::MangoAccount, 1, true);
 
         mango_group.num_mango_accounts += 1;
+
+        mango_emit_heap!(CreateMangoAccountLog {
+            mango_group: *mango_group_ai.key,
+            mango_account: *mango_account_ai.key,
+            owner: *owner_ai.key
+        });
 
         Ok(())
     }
@@ -6017,6 +6215,7 @@ impl Processor {
             dex_prog_ai,            // read
             token_prog_ai,          // read
         ] = array_ref![accounts, 0, NUM_FIXED];
+        check_eq!(token_prog_ai.key, &spl_token::ID, MangoErrorCode::InvalidProgramId)?;
 
         let mango_group = MangoGroup::load_checked(mango_group_ai, program_id)?;
         check_eq!(dex_prog_ai.key, &mango_group.dex_program_id, MangoErrorCode::InvalidProgramId)?;
@@ -6028,10 +6227,14 @@ impl Processor {
             &mango_account.owner == owner_ai.key || &mango_account.delegate == owner_ai.key,
             MangoErrorCode::InvalidOwner
         )?;
-        check!(owner_ai.is_signer, MangoErrorCode::InvalidSignerKey)?;
-        check_eq!(token_prog_ai.key, &spl_token::ID, MangoErrorCode::InvalidProgramId)?;
+        check!(owner_ai.is_signer, MangoErrorCode::SignerNecessary)?;
 
-        let market_index = mango_group.find_spot_market_index(spot_market_ai.key).unwrap();
+        let market_index = mango_group
+            .find_spot_market_index(spot_market_ai.key)
+            .ok_or(throw_err!(MangoErrorCode::InvalidMarket))?;
+
+        check_open_orders(open_orders_ai, &mango_group.signer_key, &mango_group.dex_program_id)?;
+
         check_eq!(
             &mango_account.spot_open_orders[market_index],
             open_orders_ai.key,
@@ -6067,7 +6270,6 @@ impl Processor {
         }
 
         // Settle funds released by canceling open orders
-        // TODO OPT add a new ForceSettleFunds to save compute in this instruction
         invoke_settle_funds(
             dex_prog_ai,
             spot_market_ai,
@@ -6110,6 +6312,12 @@ impl Processor {
         let quote_change = I80F48::from_num(pre_quote - post_quote);
 
         let mango_cache = MangoCache::load_checked(mango_cache_ai, program_id, &mango_group)?;
+        let clock = Clock::get()?;
+        let now_ts = clock.unix_timestamp as u64;
+
+        mango_cache.root_bank_cache[market_index].check_valid(&mango_group, now_ts)?;
+        mango_cache.root_bank_cache[QUOTE_INDEX].check_valid(&mango_group, now_ts)?;
+
         check_eq!(
             &mango_group.tokens[market_index].root_bank,
             base_root_bank_ai.key,
@@ -6138,7 +6346,6 @@ impl Processor {
         let mut quote_node_bank = NodeBank::load_mut_checked(quote_node_bank_ai, program_id)?;
         check_eq!(&quote_node_bank.vault, quote_vault_ai.key, MangoErrorCode::InvalidVault)?;
 
-        msg!("Cancel all order change {} {}", base_change.to_string(), quote_change.to_string());
         checked_change_net(
             &mango_cache.root_bank_cache[market_index],
             &mut base_node_bank,
@@ -6155,11 +6362,6 @@ impl Processor {
             QUOTE_INDEX,
             quote_change,
         )?;
-        let clock = Clock::get()?;
-        let now_ts = clock.unix_timestamp as u64;
-
-        mango_cache.root_bank_cache[market_index].check_valid(&mango_group, now_ts)?;
-        mango_cache.root_bank_cache[QUOTE_INDEX].check_valid(&mango_group, now_ts)?;
         Ok(())
     }
 
@@ -6663,6 +6865,7 @@ impl Processor {
                 order_type,
                 reduce_only,
                 limit,
+                expiry_type,
             } => {
                 msg!("Mango: PlacePerpOrder2 client_order_id={}", client_order_id);
                 Self::place_perp_order2(
@@ -6677,6 +6880,7 @@ impl Processor {
                     reduce_only,
                     expiry_timestamp,
                     limit,
+                    expiry_type,
                 )
             }
             MangoInstruction::CancelAllSpotOrders { limit } => {
@@ -6836,6 +7040,7 @@ pub fn read_oracle(
     mango_group: &MangoGroup,
     token_index: usize,
     oracle_ai: &AccountInfo,
+    last_known_price_in_cache: I80F48,
 ) -> MangoResult<I80F48> {
     let quote_decimals = mango_group.tokens[QUOTE_INDEX].decimals as i32;
     let base_decimals = mango_group.tokens[token_index].decimals as i32;
@@ -6860,6 +7065,12 @@ pub fn read_oracle(
                     value.to_num::<f64>(),
                     conf.to_num::<f64>()
                 );
+
+                // For luna, to prevent market from getting stuck, just continue using last known price in cache
+                if oracle_ai.key == &luna_pyth_oracle::ID {
+                    return Ok(last_known_price_in_cache);
+                }
+
                 return Err(throw_err!(MangoErrorCode::InvalidOraclePrice));
             }
 
@@ -6944,7 +7155,9 @@ fn checked_change_net(
         mango_account: *mango_account_pk,
         token_index: token_index as u64,
         deposit: mango_account.deposits[token_index].to_bits(),
-        borrow: mango_account.borrows[token_index].to_bits()
+        borrow: mango_account.borrows[token_index].to_bits(),
+        deposit_index: root_bank_cache.deposit_index.to_bits(),
+        borrow_index: root_bank_cache.borrow_index.to_bits(),
     });
 
     Ok(()) // This is an optimization to prevent unnecessary I80F48 calculations
