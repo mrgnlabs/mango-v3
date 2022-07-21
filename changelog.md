@@ -1,7 +1,16 @@
 # Mango Program Change Log
 
-## unreleased
+## v3.5.1
+Deployed: Jul 9, 2022 at 17:07:37 UTC | Slot: 140,876,554
+1. Remove luna related hard codings
+2. Fix deposit leach bug
+3. Fix bugs in ForceSettlePerpPosition
+
+## v3.5.0
+Deployed: Jun 27, 2022 at 18:30:08 UTC | Slot: 139,265,834
 1. Add an ExpiryType argument to PlacePerpOrder2
+2. Add delisting instructions
+3. Add Withdraw2 which passes in compact open orders
 
 ## v3.4.7
 Deployed: May 14, 2022 at 21:27:20 UTC | Slot: 133,813,868
