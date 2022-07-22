@@ -94,7 +94,8 @@ async fn test_liquidation_delisting_token_deposits_as_collateral() {
     test.cache_all_prices(
         &mango_group_cookie.mango_group,
         &mango_group_cookie.address,
-        &mango_group_cookie.mango_group.oracles[0..mango_group_cookie.mango_group.num_oracles],
+        &mango_group_cookie.mango_group.oracles
+            [0..mango_group_cookie.mango_group.num_oracles as usize],
     )
     .await;
     test.perform_deposit(&mango_group_cookie, liqee_index, market_index, liqee_deposit)
@@ -172,7 +173,8 @@ async fn test_liquidation_delisting_token_borrows() {
     test.cache_all_prices(
         &mango_group_cookie.mango_group,
         &mango_group_cookie.address,
-        &mango_group_cookie.mango_group.oracles[0..mango_group_cookie.mango_group.num_oracles],
+        &mango_group_cookie.mango_group.oracles
+            [0..mango_group_cookie.mango_group.num_oracles as usize],
     )
     .await;
     test.perform_deposit(&mango_group_cookie, liqee_index, test.quote_index, liqee_deposit)

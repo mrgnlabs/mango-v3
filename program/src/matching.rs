@@ -1,6 +1,5 @@
 use std::cell::RefMut;
 use std::convert::TryFrom;
-use std::mem::size_of;
 
 use bytemuck::{cast, cast_mut, cast_ref};
 use fixed::types::I80F48;
@@ -12,7 +11,6 @@ use solana_program::msg;
 use solana_program::pubkey::Pubkey;
 use solana_program::sysvar::rent::Rent;
 use solana_program::sysvar::Sysvar;
-use static_assertions::const_assert_eq;
 
 use mango_common::Loadable;
 use mango_logs::{mango_emit_stack, ReferralFeeAccrualLog};
@@ -196,10 +194,6 @@ pub struct AnyNode {
     pub tag: u32,
     pub data: [u8; NODE_SIZE - 4],
 }
-
-const_assert_eq!(size_of::<AnyNode>(), size_of::<InnerNode>());
-const_assert_eq!(size_of::<AnyNode>(), size_of::<LeafNode>());
-const_assert_eq!(size_of::<AnyNode>(), size_of::<FreeNode>());
 
 enum NodeRef<'a> {
     Inner(&'a InnerNode),

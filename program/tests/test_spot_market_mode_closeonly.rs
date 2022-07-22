@@ -44,7 +44,8 @@ async fn test_spot_market_mode_closeonly() {
     test.cache_all_prices(
         &mango_group_cookie.mango_group,
         &mango_group_cookie.address,
-        &mango_group_cookie.mango_group.oracles[0..mango_group_cookie.mango_group.num_oracles],
+        &mango_group_cookie.mango_group.oracles
+            [0..mango_group_cookie.mango_group.num_oracles as usize],
     )
     .await;
     test.perform_deposit(&mango_group_cookie, user_index, market_index, user_deposit)
