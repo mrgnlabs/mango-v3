@@ -11,7 +11,9 @@ use safe_transmute::{self, trivial::TriviallyTransmutable};
 use solana_program::account_info::AccountInfo;
 use solana_program::pubkey::Pubkey;
 use solana_program::sysvar::rent::Rent;
+use static_assertions::const_assert_eq;
 use std::cell::RefMut;
+use std::mem::size_of;
 
 declare_check_assert_macros!(SourceFileId::Queue);
 
@@ -409,3 +411,10 @@ impl LiquidateEvent {
         }
     }
 }
+
+#[cfg(not(feature = "disable-const-asserts"))]
+const_assert_eq!(size_of::<AnyEvent>(), size_of::<FillEvent>());
+#[cfg(not(feature = "disable-const-asserts"))]
+const_assert_eq!(size_of::<AnyEvent>(), size_of::<OutEvent>());
+#[cfg(not(feature = "disable-const-asserts"))]
+const_assert_eq!(size_of::<AnyEvent>(), size_of::<LiquidateEvent>());
