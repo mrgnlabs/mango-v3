@@ -412,9 +412,6 @@ impl LiquidateEvent {
     }
 }
 
-#[cfg(not(feature = "disable-const-asserts"))]
 const_assert_eq!(size_of::<AnyEvent>(), size_of::<FillEvent>());
-#[cfg(not(feature = "disable-const-asserts"))]
 const_assert_eq!(size_of::<AnyEvent>(), size_of::<OutEvent>());
-#[cfg(not(feature = "disable-const-asserts"))]
 const_assert_eq!(size_of::<AnyEvent>(), size_of::<LiquidateEvent>());
